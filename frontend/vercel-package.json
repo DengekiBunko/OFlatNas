@@ -1,0 +1,62 @@
+{
+    "name": "flat-nas-vercel",
+    "version": "1.1.6",
+    "license": "AGPL-3.0",
+    "private": true,
+    "type": "module",
+    "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+    },
+    "scripts": {
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview",
+        "type-check": "vue-tsc --build",
+        "lint": "eslint . --fix --cache"
+    },
+    "dependencies": {
+        "@libsql/client": "^0.14.0",
+        "@supabase/supabase-js": "^2.45.0",
+        "@vueuse/core": "^14.1.0",
+        "axios": "^1.13.4",
+        "dompurify": "^3.3.1",
+        "fuse.js": "^7.1.0",
+        "grid-layout-plus": "^1.1.1",
+        "idb": "^8.0.3",
+        "lunar-javascript": "^1.7.7",
+        "pinia": "^3.0.4",
+        "prismjs": "^1.30.0",
+        "smooth-corners": "^1.1.0",
+        "uuid": "^13.0.0",
+        "vue": "^3.5.25",
+        "vue-cropper": "^1.1.4",
+        "vue-draggable-plus": "^0.6.0",
+        "vue-router": "^4.6.3",
+        "xlsx": "^0.18.5"
+    },
+    "devDependencies": {
+        "@pinia/testing": "^1.0.3",
+        "@tailwindcss/postcss": "^4.1.17",
+        "@tsconfig/node24": "^24.0.3",
+        "@types/dompurify": "^3.0.5",
+        "@types/node": "^24.10.1",
+        "@types/prismjs": "^1.26.5",
+        "@types/uuid": "^10.0.0",
+        "@vitejs/plugin-vue": "^6.0.2",
+        "@vue/eslint-config-prettier": "^10.2.0",
+        "@vue/eslint-config-typescript": "^14.6.0",
+        "@vue/tsconfig": "^0.8.1",
+        "autoprefixer": "^10.4.22",
+        "eslint": "^9.39.1",
+        "eslint-plugin-vue": "~10.5.1",
+        "jiti": "^2.6.1",
+        "npm-run-all2": "^8.0.4",
+        "postcss": "^8.5.6",
+        "prettier": "3.6.2",
+        "tailwindcss": "^4.1.17",
+        "typescript": "~5.9.0",
+        "vite": "^7.2.4",
+        "vitest": "^2.1.3",
+        "vue-tsc": "^3.1.5"
+    }
+}

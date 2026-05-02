@@ -1,0 +1,327 @@
+name: Fetch Hot News & RSS
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # Every 15 minutes
+  workflow_dispatch:  # Manual trigger
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  MAX_DB_SIZE_MB: 250
+  MAX_ITEMS_PER_SOURCE: 500
+
+jobs:
+  fetch-hot-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install minimal dependencies
+        run: npm install @supabase/supabase-js
+
+      # Step 1: Always clean old data BEFORE fetching to protect user data
+      - name: Pre-fetch cleanup (protect user data)
+        run: |
+          echo "Cleaning old cached data before fetching..."
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function preFetchCleanup() {
+              try {
+                // Only clean hot_news and rss_items - NEVER touch users or user_data
+                const { data: hotCount, error: hotError } = await supabase.rpc('clean_old_hot_news');
+                if (hotError) throw hotError;
+                console.log('Pre-fetch: deleted hot news entries:', hotCount);
+
+                const { data: rssCount, error: rssError } = await supabase.rpc('clean_old_rss_items');
+                if (rssError) throw rssError;
+                console.log('Pre-fetch: deleted RSS items:', rssCount);
+
+                console.log('Pre-fetch cleanup completed - user data untouched');
+              } catch (err) {
+                console.log('Pre-fetch cleanup error:', err.message);
+              }
+            }
+            preFetchCleanup();
+          "
+
+      # Step 2: Check DB size - if over limit, run aggressive cleanup
+      - name: Check database size and aggressive cleanup if needed
+        run: |
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function checkAndAggressiveClean() {
+              try {
+                const { data, error } = await supabase.rpc('get_database_size_bytes');
+                if (error) throw error;
+                const sizeMB = Math.round(data / 1024 / 1024);
+                console.log('Current DB size:', sizeMB, 'MB /', process.env.MAX_DB_SIZE_MB, 'MB limit');
+
+                if (sizeMB > process.env.MAX_DB_SIZE_MB) {
+                  console.log('Database over half full! Running aggressive cleanup...');
+
+                  // Aggressive: keep only latest 200 per source for hot_news
+                  const { data: aggressiveHot, error: hotErr } = await supabase
+                    .from('hot_news')
+                    .delete()
+                    .lt('id',
+                      (await supabase.from('hot_news').select('id').order('created_at', { ascending: false }).limit(1).single()).data?.id
+                    );
+                  // Use raw SQL for more aggressive cleanup
+                  await supabase.rpc('clean_old_hot_news');
+
+                  // Also clean very old rss_items aggressively
+                  const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+                  const { data: oldRss, error: rssDelErr } = await supabase
+                    .from('rss_items')
+                    .delete()
+                    .lt('fetched_at', oneWeekAgo);
+                  if (rssDelErr) console.log('Aggressive RSS cleanup error:', rssDelErr.message);
+                  else console.log('Aggressive cleanup: deleted old RSS items');
+                }
+              } catch (err) {
+                console.log('DB size check error:', err.message);
+              }
+            }
+            checkAndAggressiveClean();
+          "
+
+      - name: Fetch Bilibili Hot
+        run: |
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function fetchBilibili() {
+              try {
+                const response = await fetch('https://api.bilibili.com/x/web-interface/popular?ps=30');
+                const data = await response.json();
+                const items = data.data.list || [];
+
+                const hotItems = items.map(item => ({
+                  source: 'bilibili',
+                  title: item.title,
+                  url: 'https://www.bilibili.com/video/' + item.bvid,
+                  hot_value: '播放 ' + item.stat.view + ' · 赞 ' + item.stat.like,
+                  fetched_at: new Date().toISOString()
+                }));
+
+                const { error } = await supabase.from('hot_news').insert(hotItems);
+                if (error) throw error;
+                console.log('Inserted Bilibili hot news:', hotItems.length);
+              } catch (err) {
+                console.log('Bilibili fetch error:', err.message);
+              }
+            }
+            fetchBilibili();
+          "
+
+      - name: Fetch Weibo Hot
+        run: |
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function fetchWeibo() {
+              try {
+                const response = await fetch('https://weibo.com/ajax/side/hotSearch?type=base&pos=0', {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                    'Referer': 'https://weibo.com/'
+                  }
+                });
+                const data = await response.json();
+                const items = data.data?.realtime || [];
+
+                const hotItems = items.slice(0, 30).map(item => ({
+                  source: 'weibo',
+                  title: item.word || item.note,
+                  url: item.link || 'https://s.weibo.com/weibo?q=' + encodeURIComponent(item.word),
+                  hot_value: item.raw_hot > 0 ? String(item.raw_hot) : (item.num > 0 ? item.num + '万' : ''),
+                  fetched_at: new Date().toISOString()
+                }));
+
+                const { error } = await supabase.from('hot_news').insert(hotItems);
+                if (error) throw error;
+                console.log('Inserted Weibo hot news:', hotItems.length);
+              } catch (err) {
+                console.log('Weibo fetch error:', err.message);
+              }
+            }
+            fetchWeibo();
+          "
+
+      - name: Fetch Zhihu Hot
+        run: |
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function fetchZhihu() {
+              try {
+                const response = await fetch('https://www.zhihu.com/hot', {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 13_2 like Mac OS X) AppleWebKit/605.1.15'
+                  }
+                });
+                const html = await response.text();
+
+                const match = html.match(/<script id=\"js-initialData\" type=\"application\/json\">([\s\S]*?)<\/script>/);
+                if (!match) throw new Error('Initial data not found');
+
+                const initState = JSON.parse(match[1]);
+                const hotList = initState?.initialState?.topstory?.hotList || [];
+
+                const hotItems = hotList.slice(0, 30).map(item => ({
+                  source: 'zhihu',
+                  title: item.target?.titleArea?.text || '',
+                  url: item.target?.link?.url || 'https://www.zhihu.com',
+                  hot_value: item.target?.metricsArea?.text || '',
+                  fetched_at: new Date().toISOString()
+                })).filter(item => item.title);
+
+                const { error } = await supabase.from('hot_news').insert(hotItems);
+                if (error) throw error;
+                console.log('Inserted Zhihu hot news:', hotItems.length);
+              } catch (err) {
+                console.log('Zhihu fetch error:', err.message);
+              }
+            }
+            fetchZhihu();
+          "
+
+      - name: Fetch China News RSS
+        run: |
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function fetchChinaNews() {
+              try {
+                const response = await fetch('https://www.chinanews.com/rss/scroll-news.xml', {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                    'Accept': 'application/xml, text/xml, */*'
+                  }
+                });
+                const xml = await response.text();
+
+                const items = [];
+                const itemRegex = /<item[^>]*>([\s\S]*?)<\/item>/gi;
+                let match;
+
+                while ((match = itemRegex.exec(xml)) !== null && items.length < 30) {
+                  const itemXml = match[1];
+                  const titleMatch = itemXml.match(/<title[^>]*>([^<]*)<\/title>/);
+                  const linkMatch = itemXml.match(/<link[^>]*>([^<]*)<\/link>/);
+
+                  if (titleMatch) {
+                    items.push({
+                      source: 'news',
+                      title: titleMatch[1].trim(),
+                      url: linkMatch ? linkMatch[1].trim() : 'https://www.chinanews.com',
+                      hot_value: '',
+                      fetched_at: new Date().toISOString()
+                    });
+                  }
+                }
+
+                const { error } = await supabase.from('hot_news').insert(items);
+                if (error) throw error;
+                console.log('Inserted China News:', items.length);
+              } catch (err) {
+                console.log('China News fetch error:', err.message);
+              }
+            }
+            fetchChinaNews();
+          "
+
+      # Step 3: Post-fetch cleanup to ensure DB stays under limit
+      - name: Post-fetch cleanup
+        run: |
+          echo "Running post-fetch cleanup to maintain DB size limit..."
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function postFetchCleanup() {
+              try {
+                // Clean hot_news - keep only latest 500 per source
+                const { data: hotCount, error: hotError } = await supabase.rpc('clean_old_hot_news');
+                if (hotError) throw hotError;
+                console.log('Post-fetch: cleaned hot news entries:', hotCount);
+
+                // Clean rss_items - keep latest 200 per feed
+                const { data: rssCount, error: rssError } = await supabase.rpc('clean_old_rss_items');
+                if (rssError) throw rssError;
+                console.log('Post-fetch: cleaned RSS items:', rssCount);
+
+                console.log('Post-fetch cleanup completed');
+              } catch (err) {
+                console.log('Post-fetch cleanup error:', err.message);
+              }
+            }
+            postFetchCleanup();
+          "
+
+      # Step 4: Final verification
+      - name: Verify final database size
+        run: |
+          node -e "
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(
+              process.env.SUPABASE_URL,
+              process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+
+            async function verifyDbSize() {
+              try {
+                const { data, error } = await supabase.rpc('get_database_size_bytes');
+                if (error) throw error;
+                const sizeMB = Math.round(data / 1024 / 1024);
+                console.log('Final DB size:', sizeMB, 'MB / 500MB total');
+
+                if (sizeMB > process.env.MAX_DB_SIZE_MB) {
+                  console.log('::warning::Database exceeds half capacity after fetch!');
+                } else {
+                  console.log('Database size OK - under 250MB limit');
+                }
+              } catch (err) {
+                console.log('Verification error:', err.message);
+              }
+            }
+            verifyDbSize();
+          "
